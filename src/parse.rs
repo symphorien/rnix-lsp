@@ -5,13 +5,14 @@ use std::iter::FromIterator;
 
 use crate::error::{EvalError, InternalError, ValueError, ERR_PARSING};
 use crate::eval::{merge_set_literal, StringPartSource};
+use crate::scope::{ArgBindingInfo, LetBindingInfo};
 use crate::value::*;
 use crate::{
     eval::{Expr, ExprSource},
     scope::Scope,
 };
 use gc::{Finalize, Gc, GcCell, Trace};
-use maplit::hashset;
+use maplit::hashmap;
 use rnix::types::{EntryHolder, TokenWrapper, TypedNode};
 use rnix::{TextRange, StrPart, SyntaxKind};
 use rnix::{
@@ -47,7 +48,7 @@ fn parse_entry_holder<T: EntryHolder>(
     is_recursive: bool,
 ) -> Result<
     (
-        HashMap<String, Gc<Expr>>,
+        HashMap<String, LetBindingInfo>,
         Vec<Result<Gc<Expr>, EvalError>>,
         Gc<Scope>,
     ),
@@ -66,7 +67,7 @@ fn parse_entry_holder<T: EntryHolder>(
     };
 
     // Used for the NixValue of this attribute set.
-    let mut value_map = HashMap::new();
+    let mut value_map: HashMap<String, LetBindingInfo> = HashMap::new();
     // Used for the ExprSource. See ExprSource::AttrSet for
     // details on why we create both a hashmap and a vector.
     let mut definitions = vec![];
@@ -111,6 +112,7 @@ fn parse_entry_holder<T: EntryHolder>(
 
         let mut cursor_range = TextRange::new(here_start, entry_end);
         let mut cursor_key_name = inmost_key.as_ident()?;
+        let mut cursor_key_range: TextRange = inmost_key.range.unwrap_or(cursor_range);
         let mut cursor_value = Gc::new(Expr {
             value: GcCell::new(None),
             source: ExprSource::KeyValuePair {
@@ -140,6 +142,7 @@ fn parse_entry_holder<T: EntryHolder>(
 
             cursor_range = TextRange::new(here_start, entry_end);
             cursor_key_name = element.as_ref()?.as_ident()?;
+            cursor_key_range = element.as_ref()?.range.unwrap_or(cursor_range);
             cursor_value = Gc::new(Expr {
                 value: GcCell::new(None),
                 source: ExprSource::KeyValuePair {
@@ -155,15 +158,19 @@ fn parse_entry_holder<T: EntryHolder>(
 
         // Merge values if needed. For example:
         // { a.b = 1; a.c = 2; } => { a = { b = 1; c = 2; }; }
-        let merged_value = match value_map.get(&cursor_key_name) as Option<&Gc<Expr>> {
+        let merged_value = match value_map.get(&cursor_key_name) {
             Some(existing) => merge_set_literal(
                 cursor_key_name.clone(),
-                existing.clone(),
+                existing.value.clone(),
                 cursor_value.clone(),
             )?,
             None => cursor_value,
         };
-        value_map.insert(cursor_key_name, merged_value);
+        let new_info = LetBindingInfo {
+            value: merged_value,
+            identifier_range: cursor_key_range,
+        };
+        value_map.insert(cursor_key_name, new_info);
     }
 
     use std::collections::hash_map::Entry;
@@ -209,17 +216,23 @@ fn parse_entry_holder<T: EntryHolder>(
                 });
                 definitions.push(Ok(attr.clone()));
                 let name = name.to_string();
+                let identifier_range = ident.node().text_range();
+                let info = LetBindingInfo {
+                    identifier_range,
+                    value: attr,
+                };
                 match value_map.entry(name.clone()) {
                     Entry::Occupied(_) => {
                         return Err(EvalError::Value(ValueError::AttrAlreadyDefined(name)))
                     }
-                    Entry::Vacant(entry) => entry.insert(attr),
+                    Entry::Vacant(entry) => entry.insert(info),
                 };
             }
         } else {
             // Handle `inherit` from scope
             for ident in inherit.idents() {
                 let name = ident.as_str();
+                let identifier_range = ident.node().text_range();
                 let attr = Gc::new(Expr {
                     value: GcCell::new(None),
                     source: ExprSource::Ident {
@@ -230,11 +243,15 @@ fn parse_entry_holder<T: EntryHolder>(
                 });
                 definitions.push(Ok(attr.clone()));
                 let name = name.to_string();
+                let info = LetBindingInfo {
+                    identifier_range,
+                    value: attr,
+                };
                 match value_map.entry(name.clone()) {
                     Entry::Occupied(_) => {
                         return Err(EvalError::Value(ValueError::AttrAlreadyDefined(name)))
                     }
-                    Entry::Vacant(entry) => entry.insert(attr),
+                    Entry::Vacant(entry) => entry.insert(info),
                 };
             }
         }
@@ -294,6 +311,8 @@ impl Expr {
 
                 let (value_map, definitions, new_scope) =
                     parse_entry_holder(&set, scope, is_recursive)?;
+
+                let value_map = value_map.into_iter().map(|(name, info)| (name, info.value.clone())).collect();
 
                 return Ok(Expr {
                     value: GcCell::new(Some(Gc::new(NixValue::Map(value_map)))),
@@ -400,12 +419,15 @@ impl Expr {
                 arg: recurse_option_box(apply.value()),
             },
             ParsedType::Pattern(pattern) => {
-                let mut names = std::collections::HashSet::new();
+                let mut names = std::collections::HashMap::new();
                 let at = match pattern.at() {
                     None => None,
                     Some(at) => {
                         let string = at.as_str().to_string();
-                        names.insert(string.clone());
+                        let info = ArgBindingInfo {
+                            identifier_range: at.node().text_range(),
+                        };
+                        names.insert(string.clone(), info);
                         Some(string)
                     }
                 };
@@ -415,7 +437,10 @@ impl Expr {
                             return Err(EvalError::Internal(InternalError::Unimplemented("none name for pattern entry".to_string())));
                         }
                         Some(name) => {
-                            names.insert(name.as_str().to_string());
+                            let info = ArgBindingInfo {
+                                identifier_range: name.node().text_range(),
+                            };
+                            names.insert(name.as_str().to_string(), info);
                         },
                     }
                 }
@@ -452,9 +477,12 @@ impl Expr {
                 let arg = recurse_box(fun.arg().ok_or(ERR_PARSING)?)?;
                 let new_scope = match &arg.source {
                     ExprSource::Ident { name } => {
+                        let info = ArgBindingInfo {
+                            identifier_range: fun.arg().unwrap_or(node).text_range(),
+                        };
                         Gc::new(Scope::FunctionArguments {
                             parent: scope.clone(),
-                            names: GcCell::new(hashset!{ name.as_str().to_string() }),
+                            names: GcCell::new(hashmap!{ name.as_str().to_string() => info }),
                         })
                     },
                     ExprSource::Pattern { .. } => arg.scope.clone(),

@@ -4,7 +4,7 @@ use rnix::types::Wrapper;
 use scope::Scope;
 use std::borrow::Borrow;
 use value::NixValue;
-use crate::static_analysis;
+use crate::static_analysis::{self, Alarm, AlarmKind};
 
 #[cfg(test)]
 use maplit::hashmap;
@@ -22,17 +22,34 @@ fn eval(code: &str) -> NixValue {
     let root = ast.root().inner().unwrap();
     let path = std::env::current_dir().unwrap();
     let out = Expr::parse(root, Gc::new(Scope::Root(path))).unwrap();
-    assert_eq!(static_analysis::check(&out), Vec::new());
+    let errors: Vec<Alarm> = static_analysis::check(&out)
+        .into_iter()
+        .filter(|alarm| matches!(alarm.kind, AlarmKind::Error(_)))
+        .collect();
+    assert_eq!(errors, Vec::new());
     let tmp = out.eval();
     let val: &NixValue = tmp.as_ref().unwrap().borrow();
     val.clone()
 }
 
 #[allow(dead_code)]
-/// Returns the errors found by static_analysis::check.
+/// Returns the alarms found by static_analysis::check.
 ///
 /// As dealing with ranges is cumbersome, returns a map "text matched by the range" => "error text"
+/// Also mixes warnings and errors without distinguisher.
+/// A shortcut to static_analysis_verbose(code, false)
 fn static_analysis(code: &str) -> HashMap<&str, String> {
+    static_analysis_verbose(code, false)
+}
+
+#[allow(dead_code)]
+/// Returns the alarms found by static_analysis::check.
+///
+/// As dealing with ranges is cumbersome, returns a map "text matched by the range" => "error text"
+/// If verbose is true, then the error message also contains a textual representation
+/// of the range.
+/// Also mixes warnings and errors without distinguisher.
+fn static_analysis_verbose(code: &str, verbose: bool) -> HashMap<&str, String> {
     let ast = rnix::parse(&code);
     let root = ast.root().inner().unwrap();
     let path = std::env::current_dir().unwrap();
@@ -42,7 +59,12 @@ fn static_analysis(code: &str) -> HashMap<&str, String> {
     for error in errors {
         let range = error.range.start().into()..error.range.end().into();
         let text = code.get(range).unwrap();
-        res.insert(text, error.kind.to_string());
+        let error_text = if verbose {
+            error.to_string()
+        } else {
+            error.kind.to_string()
+        };
+        res.insert(text, error_text);
     }
     res
 }
@@ -256,13 +278,19 @@ fn bound_let_inherit() {
 #[test]
 fn unbound_let_inherit() {
     let code = "let foo = {a = 1;}; in let inherit (bar) a; in a";
-    assert_eq!(static_analysis(code), hashmap! {"bar" => "identifier bar is unbound".into()});
+    assert_eq!(static_analysis(code), hashmap! {
+        "bar" => "identifier bar is unbound".into(),
+        "foo" => "binding foo is unused".into()
+    });
 }
 
 #[test]
 fn unbound_let_inherit2() {
-    let code = "let foo = {a = 1;}; in let inherit (foo) a; in aaaa";
-    assert_eq!(static_analysis(code), hashmap! {"aaaa" => "identifier aaaa is unbound".into()});
+    let code = "let foo = {bbbb = 1;}; in let inherit (foo) bbbb; in aaaa";
+    assert_eq!(static_analysis(code), hashmap! {
+        "aaaa" => "identifier aaaa is unbound".into(),
+        "bbbb" => "binding bbbb is unused".into()
+    });
 }
 
 #[test]
@@ -305,7 +333,11 @@ fn unbound_multiline_string() {
 #[test]
 fn unbound_config() {
     let code = "{config, pkgs, ...}: { config = { services.xserver.enable = lib.mkForce true; }; }";
-    assert_eq!(static_analysis(code), hashmap! {"lib" => "identifier lib is unbound".into()});
+    assert_eq!(static_analysis(code), hashmap! {
+        "lib" => "identifier lib is unbound".into(),
+        "config" => "binding config is unused".into(),
+        "pkgs" => "binding pkgs is unused".into()
+    });
 }
 
 #[test]
@@ -313,15 +345,136 @@ fn unbound_config2() {
     let code = "{config, pkgs, ...}: { config = { environment.systemPackages = [ (lib.hiPrio pkgs.sl) firefox ]; }";
     assert_eq!(
         static_analysis(code),
-        hashmap! {"lib" => "identifier lib is unbound".into(), "firefox" => "identifier firefox is unbound".into()}
+        hashmap! {
+            "lib" => "identifier lib is unbound".into(),
+            "firefox" => "identifier firefox is unbound".into(),
+            "config" => "binding config is unused".into(),
+        }
     );
 }
 
 #[test]
 fn maybe_bound_config3() {
     let code = "{config, pkgs, ...}: { config = { environment.systemPackages = with pkgs; [ (lib.hiPrio sl) firefox ]; }";
+    assert_eq!(static_analysis(code), hashmap! {
+        "config" => "binding config is unused".into(),
+    });
+}
+
+#[test]
+fn unused_binding_simple_lamba() {
+    let code = "foo: 1";
+    assert_eq!(static_analysis(code), hashmap! {
+        "foo" => "binding foo is unused".into(),
+    });
+}
+
+#[test]
+fn unused_binding_pattern_lamba() {
+    let code = "{foo}: 1";
+    assert_eq!(static_analysis(code), hashmap! {
+        "foo" => "binding foo is unused".into(),
+    });
+}
+
+#[test]
+fn unused_binding_pattern_lamba_2() {
+    let code = "{foo}@args: foo";
+    assert_eq!(static_analysis(code), hashmap! {
+        "args" => "binding args is unused".into(),
+    });
+}
+
+#[test]
+fn unused_binding_let() {
+    let code = "let foo = 1; in 2";
+    assert_eq!(static_analysis(code), hashmap! {
+        "foo" => "binding foo is unused".into(),
+    });
+}
+
+#[test]
+fn unused_binding_let2() {
+    let code = "let foo.bar = 1; foo.baz = 3; in 2";
+    assert_eq!(static_analysis(code), hashmap! {
+        "foo" => "binding foo is unused".into(),
+    });
+}
+
+#[test]
+fn unused_binding_shadowing() {
+    let code = "let foo = 1; in let foo = 2; in foo";
+    assert_eq!(static_analysis_verbose(code, true), hashmap! {
+        "foo" => "binding foo is unused at 4..7".into(),
+    });
+}
+
+#[test]
+fn unused_binding_shadowing_lambda() {
+    let code = "foo: (foo: foo)";
+    assert_eq!(static_analysis_verbose(code, true), hashmap! {
+        "foo" => "binding foo is unused at 0..3".into(),
+    });
+}
+
+#[test]
+fn unused_binding_with() {
+    let code = "{pkgs, lib}: with pkgs; 1";
+    assert_eq!(static_analysis(code), hashmap! {
+        "lib" => "binding lib is unused".into(),
+    });
+}
+
+#[test]
+fn used_binding_with() {
+    let code = "{pkgs, lib}: with pkgs; lib.makeBinPath [ pkgs.sl ]";
     assert_eq!(static_analysis(code), hashmap! {});
 }
+
+#[test]
+fn unused_underscore_is_ok() {
+    let code = "_: 1";
+    assert_eq!(static_analysis(code), hashmap! {});
+}
+
+#[test]
+fn unused_underscore_is_ok2() {
+    let code = "let _unused = 1; in 2";
+    assert_eq!(static_analysis(code), hashmap! {});
+}
+
+#[test]
+fn unused_attrset_is_ok() {
+    // this is a design decision that could be revisited
+    let code = "let complex = rec { a = 1; b = 2; }; in complex.b";
+    assert_eq!(static_analysis(code), hashmap! {});
+}
+
+#[test]
+fn unused_attrset_is_ok2() {
+    // this is a design decision that could be revisited
+    let code = "rec { a = 1; b = 2; }";
+    assert_eq!(static_analysis(code), hashmap! {});
+}
+
+#[test]
+fn no_unused_with_unparsed_child() {
+    // don't warn about unused bindings when a child is not parsed (it could
+    // use the variable)
+    let code = "let error = 1; in syntax::${error}\"";
+    assert_eq!(static_analysis(code), hashmap! {});
+}
+
+#[test]
+fn unused_with_unparsed_sibling() {
+    // don't warn about unused bindings when a child is not parsed (it could
+    // use the variable) but do it when it's only a sibling
+    let code = "let error = 1; in ((syntax::error) + (let unused = 2; in 2))";
+    assert_eq!(static_analysis(code), hashmap! {
+        "unused" => "binding unused is unused".into(),
+    });
+}
+
 
 #[cfg(test)]
 fn prepare_integration_test(code: &str, filename: &str) -> (Connection, StoppableHandle<()>) {

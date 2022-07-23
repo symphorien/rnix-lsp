@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, fmt::Display};
 
 use gc::{Finalize, Trace};
 use rnix::TextRange;
@@ -74,7 +74,7 @@ pub enum ValueError {
 
 #[derive(Debug, Clone, Trace, Finalize, PartialEq, Eq)]
 /// An error augmented with a location
-pub struct Located<T: Error + Clone + Trace + Finalize> {
+pub struct Located<T: Clone + Trace + Finalize> {
     /// Where the error is located
     #[unsafe_ignore_trace]
     pub range: TextRange,
@@ -84,7 +84,7 @@ pub struct Located<T: Error + Clone + Trace + Finalize> {
 
 impl<T: Error + Clone + Trace + Finalize> std::error::Error for Located<T> {}
 
-impl<T: Error + Clone + Trace + Finalize> std::fmt::Display for Located<T> {
+impl<T: Display + Clone + Trace + Finalize> std::fmt::Display for Located<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{} at {:?}", &self.kind, &self.range)
     }

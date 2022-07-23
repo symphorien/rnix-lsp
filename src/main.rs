@@ -611,24 +611,19 @@ impl App {
             }
         }
         // errors reported by crate::static_analysis
-        let errors = match parsed {
+        let alarms = match parsed {
             Ok(v) => static_analysis::check(v),
             Err(EvalError::Value(e)) => {
                 let range = TextRange::up_to(TextSize::of(code));
-                vec![error::Located { range, kind: e.clone() }]
+                vec![error::Located { range, kind: static_analysis::AlarmKind::Error(e.clone()) }]
             },
             Err(EvalError::Internal(_)) => {
                 // don't report false positives
                 vec![]
             },
         };
-        for error in errors {
-                diagnostics.push(Diagnostic {
-                    range: utils::range(code, error.range),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: error.kind.to_string(),
-                    ..Diagnostic::default()
-                });
+        for alarm in alarms {
+                diagnostics.push(alarm.to_diagnostic(code));
         }
         self.notify(Notification::new(
             "textDocument/publishDiagnostics".into(),
