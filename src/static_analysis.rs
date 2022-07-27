@@ -131,14 +131,6 @@ impl Visitor {
         }
     }
 
-    /// like add_scope but with a node as input
-    fn add_scope_of<T: Borrow<Expr>>(&mut self, node: &Result<T, EvalError>) {
-        match node {
-            Ok(e) => self.add_scope(&(e.borrow().scope)),
-            Err(_) => (),
-        }
-    }
-
     /// If this is an error, maybe report it to self.errors. Otherwise, visit all children of this node
     /// to find evaluation errors and collect diagnostics.
     ///
@@ -192,7 +184,7 @@ impl Visitor {
                 nok |= self.visit_result(index, &node.range, IsNotVariable);
             }
             ExprSource::Lambda { arg, body } => {
-                self.add_scope_of(body);
+                self.add_scope(node.scope.as_ref());
                 nok |= self.visit_result(body, &node.range, IsVariable);
                 nok |= self.visit_result(arg, &node.range, IsNotVariable);
                 self.finish_scope_of(node.range, nok);

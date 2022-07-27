@@ -490,7 +490,12 @@ impl Expr {
                 };
                 let body =
                     Expr::parse(fun.body().ok_or(ERR_PARSING)?, new_scope.clone()).map(Box::new);
-                ExprSource::Lambda { arg: Ok(arg), body }
+                return Ok(Expr {
+                    value: GcCell::new(None),
+                    source: ExprSource::Lambda { arg: Ok(arg), body },
+                    range,
+                    scope: new_scope,
+                });
             }
             ParsedType::List(list) => ExprSource::List {
                 elements: list.items().map(recurse_gc).collect(),

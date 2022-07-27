@@ -458,6 +458,16 @@ fn unused_attrset_is_ok2() {
 }
 
 #[test]
+fn unused_attrset_is_ok3() {
+    // this is a design decision that could be revisited
+    let code = "self: super: rec { bar = null; }";
+    assert_eq!(static_analysis(code), hashmap! {
+        "self" => "binding self is unused".into(),
+        "super" => "binding super is unused".into(),
+    });
+}
+
+#[test]
 fn no_unused_with_unparsed_child() {
     // don't warn about unused bindings when a child is not parsed (it could
     // use the variable)
